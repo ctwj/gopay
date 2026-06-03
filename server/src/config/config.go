@@ -1,7 +1,9 @@
 package config
 
 import (
+	crand "crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"log"
 	"os"
 	"path/filepath"
@@ -39,8 +41,8 @@ func LoadConfig(dbPath, port string) {
 		DBProvided: strings.TrimSpace(dbPath) != "",
 		Port:       port,
 		AdminUser:  "admin",
-		AdminPwd:   "12345678",
-		SysKey:     "paygosyskey2024",
+		AdminPwd:   "",    // 首次启动时由 initSecurityCredentials() 随机生成
+		SysKey:     "",    // 首次启动时由 initSecurityCredentials() 随机生成
 	}
 }
 
@@ -196,6 +198,9 @@ func InitDB() {
 
 	// 初始化默认配置（必须在 loadAdminConfig 之前）
 	initDefaultConfig()
+
+	// 初始化安全凭证（随机生成管理员密码和系统密钥）
+	initSecurityCredentials()
 
 	// 初始化默认用户组
 	initDefaultGroup()
@@ -465,4 +470,46 @@ func ensureSettleTransferNoColumn(db *sql.DB) {
 		return
 	}
 	log.Printf("[init] migration applied: add settle.transfer_no")
+}
+
+// generateRandomString 生成指定长度的随机十六进制字符串（使用 crypto/rand）
+func generateRandomString(length int) string {
+	bytes := make([]byte, (length+1)/2)
+	if _, err := crand.Read(bytes); err != nil {
+		log.Fatalf("[init] generate random bytes failed: %v", err)
+	}
+	return hex.EncodeToString(bytes)[:length]
+}
+
+// initSecurityCredentials 首次启动时随机生成管理员密码和系统密钥
+// 如果数据库中已存在则跳过（升级不影响现有部署）
+func initSecurityCredentials() {
+	changed := false
+
+	// 检查并生成管理员密码
+	var count int64
+	DB.Model(&model.Config{}).Where("k = ?", "admin_pwd").Count(&count)
+	if count == 0 {
+		rawPwd := generateRandomString(16)
+		DB.Create(&model.Config{K: "admin_pwd", V: rawPwd})
+		log.Println("============================================")
+		log.Printf("[init] 管理员初始密码已随机生成: %s", rawPwd)
+		log.Println("[init] ⚠️ 请立即登录管理后台修改密码！")
+		log.Println("[init] ⚠️ 此信息仅显示一次，请妥善保管！")
+		log.Println("============================================")
+		changed = true
+	}
+
+	// 检查并生成系统密钥
+	DB.Model(&model.Config{}).Where("k = ?", "sys_key").Count(&count)
+	if count == 0 {
+		sysKey := generateRandomString(64)
+		DB.Create(&model.Config{K: "sys_key", V: sysKey})
+		log.Println("[init] 系统密钥(SysKey)已随机生成")
+		changed = true
+	}
+
+	if !changed {
+		log.Println("[init] security credentials loaded from database")
+	}
 }
