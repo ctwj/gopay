@@ -123,18 +123,18 @@ cd server && go build -o gopay ./src
 
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
-| `-db` | 数据库文件路径 | 平台默认路径 |
+| `-db` | PostgreSQL 连接字符串 | 无（必须指定） |
 | `-host` | 监听 IP | `0.0.0.0` |
 | `-port` | 监听端口 | `8080` |
 | `-migrate` | 执行数据库迁移 | `false` |
 
-## 默认数据库路径
+**数据库连接示例**：
 
-| 平台 | 路径 |
-| --- | --- |
-| Windows | `%APPDATA%\gopay\gopay.db` |
-| macOS | `~/Library/Application Support/gopay/gopay.db` |
-| Linux | `~/.gopay/gopay.db` |
+```bash
+./gopay -db "host=127.0.0.1 port=5432 user=gopay password=your_password dbname=gopay sslmode=disable"
+```
+
+详细部署指南请参阅 [DEPLOY.md](DEPLOY.md)。
 
 ## 跨平台构建
 
