@@ -4,6 +4,7 @@ import (
 	crand "crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -512,4 +513,134 @@ func initSecurityCredentials() {
 	if !changed {
 		log.Println("[init] security credentials loaded from database")
 	}
+}
+
+// ─── 配置文件支持 ──────────────────────────────────────────
+
+// ConfigFileValues 存储从配置文件加载的值
+var ConfigFileValues map[string]string
+
+// configFileSearchPaths 配置文件搜索路径（按优先级排序）
+var configFileSearchPaths = []string{
+	"gopay.env",
+	"config.env",
+	".env",
+}
+
+// FindConfigFile 查找配置文件，返回找到的路径
+// 如果指定了 explicitPath 则直接使用该路径
+func FindConfigFile(explicitPath string) string {
+	if explicitPath != "" {
+		abs, err := filepath.Abs(explicitPath)
+		if err != nil {
+			return explicitPath
+		}
+		return abs
+	}
+
+	// 按优先级搜索
+	for _, name := range configFileSearchPaths {
+		// 当前工作目录
+		if wd, err := os.Getwd(); err == nil {
+			p := filepath.Join(wd, name)
+			if fileExists(p) {
+				return p
+			}
+		}
+		// 可执行文件同目录
+		if exe, err := os.Executable(); err == nil {
+			p := filepath.Join(filepath.Dir(exe), name)
+			if fileExists(p) {
+				return p
+			}
+		}
+	}
+
+	// Linux 系统级配置
+	if runtime.GOOS == "linux" {
+		systemPaths := []string{
+			"/etc/gopay/config.env",
+			"/etc/gopay/gopay.env",
+		}
+		for _, p := range systemPaths {
+			if fileExists(p) {
+				return p
+			}
+		}
+	}
+
+	return ""
+}
+
+// LoadConfigFile 从指定路径加载 .env 格式配置文件
+// 格式: KEY=VALUE，支持 # 注释和空行
+func LoadConfigFile(path string) error {
+	if path == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("读取配置文件失败: %w", err)
+	}
+
+	if ConfigFileValues == nil {
+		ConfigFileValues = make(map[string]string)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		// 跳过空行和注释
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// 解析 KEY=VALUE
+		idx := strings.Index(line, "=")
+		if idx < 0 {
+			continue
+		}
+
+		key := strings.TrimSpace(line[:idx])
+		value := strings.TrimSpace(line[idx+1:])
+
+		// 去除引号
+		if len(value) >= 2 {
+			if (value[0] == '"' && value[len(value)-1] == '"') ||
+				(value[0] == '\'' && value[len(value)-1] == '\'') {
+				value = value[1 : len(value)-1]
+			}
+		}
+
+		if key != "" {
+			ConfigFileValues[key] = value
+		}
+	}
+
+	log.Printf("[config] loaded config file: %s (%d entries)", path, len(ConfigFileValues))
+	return nil
+}
+
+// GetConfigValue 获取配置值，优先级：命令行参数 > 配置文件 > 默认值
+// flagVal 是命令行参数的值，key 是配置文件中的键名，defaultVal 是默认值
+// 如果 flagVal 非空则直接返回（命令行优先），否则查找配置文件，最后返回默认值
+func GetConfigValue(flagVal string, key string, defaultVal string) string {
+	if strings.TrimSpace(flagVal) != "" {
+		return strings.TrimSpace(flagVal)
+	}
+	if v, ok := ConfigFileValues[key]; ok {
+		return v
+	}
+	return defaultVal
+}
+
+// fileExists 检查文件是否存在
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
 }

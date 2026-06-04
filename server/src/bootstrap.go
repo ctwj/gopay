@@ -57,11 +57,11 @@ func initRuntime(opts runtimeOptions) (*gin.Engine, string, string, string) {
 
 	host := strings.TrimSpace(opts.Host)
 	if host == "" {
-		host = "0.0.0.0"
+		host = config.GetConfigValue("", "HOST", "0.0.0.0")
 	}
 	port := strings.TrimSpace(opts.Port)
 	if port == "" {
-		port = "8080"
+		port = config.GetConfigValue("", "PORT", "8080")
 	}
 	addr := net.JoinHostPort(host, port)
 	openURL := buildOpenURL(host, port)
