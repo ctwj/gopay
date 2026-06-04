@@ -31,13 +31,14 @@ func parseTrustedProxies(raw string) []string {
 
 type runtimeOptions struct {
 	DBPath  string
+	DBType  string
 	Host    string
 	Port    string
 	Migrate bool
 }
 
 func initRuntime(opts runtimeOptions) (*gin.Engine, string, string, string) {
-	config.LoadConfig(opts.DBPath, opts.Port)
+	config.LoadConfig(opts.DBPath, opts.DBType, opts.Port)
 	config.InitDB()
 
 	service.InitSmsService()
@@ -50,9 +51,11 @@ func initRuntime(opts runtimeOptions) (*gin.Engine, string, string, string) {
 		}
 	}
 
-	dbDir := filepath.Dir(config.AppConfig.DBPath)
-	if err := os.MkdirAll(dbDir, 0755); err != nil {
-		log.Fatalf("[init] create database directory failed: %v", err)
+	if config.AppConfig.IsSQLite() {
+		dbDir := filepath.Dir(config.AppConfig.DBPath)
+		if err := os.MkdirAll(dbDir, 0755); err != nil {
+			log.Fatalf("[init] create database directory failed: %v", err)
+		}
 	}
 
 	host := strings.TrimSpace(opts.Host)
@@ -100,15 +103,15 @@ func runMigrations() error {
 	}{
 		{
 			name: "idx_order_uid_status_addtime",
-			sql:  "CREATE INDEX IF NOT EXISTS idx_order_uid_status_addtime ON `order`(uid, status, addtime)",
+			sql:  "CREATE INDEX IF NOT EXISTS idx_order_uid_status_addtime ON \"order\"(uid, status, addtime)",
 		},
 		{
 			name: "idx_order_notify_status_time",
-			sql:  "CREATE INDEX IF NOT EXISTS idx_order_notify_status_time ON `order`(notify, status, notifytime)",
+			sql:  "CREATE INDEX IF NOT EXISTS idx_order_notify_status_time ON \"order\"(notify, status, notifytime)",
 		},
 		{
 			name: "idx_order_out_trade_no_uid",
-			sql:  "CREATE INDEX IF NOT EXISTS idx_order_out_trade_no_uid ON `order`(out_trade_no, uid)",
+			sql:  "CREATE INDEX IF NOT EXISTS idx_order_out_trade_no_uid ON \"order\"(out_trade_no, uid)",
 		},
 		{
 			name: "idx_settle_uid_status_addtime",
@@ -128,7 +131,7 @@ func runMigrations() error {
 		},
 		{
 			name: "idx_regcode_scene_to_status_time",
-			sql:  "CREATE INDEX IF NOT EXISTS idx_regcode_scene_to_status_time ON regcode(scene, `to`, status, time)",
+			sql:  "CREATE INDEX IF NOT EXISTS idx_regcode_scene_to_status_time ON regcode(scene, \"to\", status, time)",
 		},
 		{
 			name: "idx_invitecode_code_unique",

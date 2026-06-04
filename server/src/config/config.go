@@ -13,12 +13,14 @@ import (
 
 	"gopay/src/model"
 
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
 type Config struct {
 	DBPath     string
+	DBType     string // "sqlite" 或 "postgres"，空字符串表示自动检测
 	DBProvided bool
 	Port       string
 	AdminUser  string
@@ -26,19 +28,56 @@ type Config struct {
 	SysKey     string
 }
 
+// IsPostgres 判断当前是否使用 PostgreSQL
+func (c *Config) IsPostgres() bool {
+	return c.DBType == "postgres"
+}
+
+// IsSQLite 判断当前是否使用 SQLite
+func (c *Config) IsSQLite() bool {
+	return c.DBType == "" || c.DBType == "sqlite"
+}
+
+// DetectDBType 根据 DB 连接串自动判断数据库类型
+// 返回 "sqlite" 或 "postgres"
+func DetectDBType(dbDSN string) string {
+	s := strings.TrimSpace(dbDSN)
+	if strings.HasPrefix(s, "postgres://") || strings.HasPrefix(s, "postgresql://") {
+		return "postgres"
+	}
+	if strings.Contains(s, "host=") && strings.Contains(s, "dbname=") {
+		return "postgres"
+	}
+	return "sqlite"
+}
+
 var AppConfig *Config
 var DB *gorm.DB
 
-func LoadConfig(dbPath, port string) {
+func LoadConfig(dbPath, dbType, port string) {
 	resolvedDBPath := strings.TrimSpace(dbPath)
-	if resolvedDBPath == "" {
-		resolvedDBPath = resolveAutoDBPath()
-	} else if absPath, err := filepath.Abs(resolvedDBPath); err == nil {
-		resolvedDBPath = absPath
+
+	// 解析数据库类型：显式指定 > 自动检测
+	resolvedDBType := strings.TrimSpace(dbType)
+	if resolvedDBType == "" && resolvedDBPath != "" {
+		resolvedDBType = DetectDBType(resolvedDBPath)
+	}
+	if resolvedDBType == "" {
+		resolvedDBType = "sqlite"
+	}
+
+	// SQLite 模式下解析文件路径
+	if resolvedDBType == "sqlite" {
+		if resolvedDBPath == "" {
+			resolvedDBPath = resolveAutoDBPath()
+		} else if absPath, err := filepath.Abs(resolvedDBPath); err == nil {
+			resolvedDBPath = absPath
+		}
 	}
 
 	AppConfig = &Config{
 		DBPath:     resolvedDBPath,
+		DBType:     resolvedDBType,
 		DBProvided: strings.TrimSpace(dbPath) != "",
 		Port:       port,
 		AdminUser:  "admin",
@@ -128,19 +167,25 @@ func DefaultDBPath() string {
 func InitDB() {
 	var err error
 	dbPath := AppConfig.DBPath
-	if fi, statErr := os.Stat(dbPath); statErr == nil && !fi.IsDir() {
-		log.Printf("[init] database file exists: path=%s", dbPath)
-	} else if AppConfig.DBProvided {
-		log.Printf("[init] WARNING: explicit -db file not found, will create new database: path=%s", dbPath)
-	}
 
-	// 确保目录存在
-	dir := filepath.Dir(dbPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Fatalf("[init] create database directory failed: %v", err)
-	}
+	if AppConfig.IsSQLite() {
+		if fi, statErr := os.Stat(dbPath); statErr == nil && !fi.IsDir() {
+			log.Printf("[init] database file exists: path=%s", dbPath)
+		} else if AppConfig.DBProvided {
+			log.Printf("[init] WARNING: explicit -db file not found, will create new database: path=%s", dbPath)
+		}
 
-	DB, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+		// 确保目录存在
+		dir := filepath.Dir(dbPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			log.Fatalf("[init] create database directory failed: %v", err)
+		}
+
+		DB, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	} else {
+		log.Printf("[init] connecting to PostgreSQL: dsn=%s", maskDSN(dbPath))
+		DB, err = gorm.Open(postgres.Open(dbPath), &gorm.Config{})
+	}
 	if err != nil {
 		log.Fatalf("[init] database connection failed: %v", err)
 	}
@@ -241,6 +286,14 @@ func loadAdminConfig() {
 func setAutoIncrementStart(db *sql.DB) {
 	const minSeq = int64(9999) // 下一条自增ID将从10000开始
 
+	if AppConfig.IsSQLite() {
+		setAutoIncrementStartSQLite(db, minSeq)
+	} else {
+		setAutoIncrementStartPostgres(db, minSeq)
+	}
+}
+
+func setAutoIncrementStartSQLite(db *sql.DB, minSeq int64) {
 	rows, err := db.Query(`
 		SELECT name
 		FROM sqlite_master
@@ -275,6 +328,58 @@ func setAutoIncrementStart(db *sql.DB) {
 		}
 		if _, err := db.Exec(`INSERT INTO sqlite_sequence(name, seq) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = ?)`, table, minSeq, table); err != nil {
 			log.Printf("[init] insert sqlite_sequence failed: table=%s, error=%v", table, err)
+			continue
+		}
+	}
+}
+
+func setAutoIncrementStartPostgres(db *sql.DB, minSeq int64) {
+	// 查询所有使用序列的列（serial/bigserial）
+	rows, err := db.Query(`
+		SELECT c.table_name, c.column_name
+		FROM information_schema.columns c
+		WHERE c.column_default LIKE 'nextval%'
+		  AND c.table_schema = 'public'
+	`)
+	if err != nil {
+		log.Printf("[init] query postgres serial columns failed: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	type colInfo struct {
+		TableName  string
+		ColumnName string
+	}
+	columns := make([]colInfo, 0, 32)
+	for rows.Next() {
+		var col colInfo
+		if err := rows.Scan(&col.TableName, &col.ColumnName); err != nil {
+			log.Printf("[init] scan postgres serial column failed: %v", err)
+			continue
+		}
+		columns = append(columns, col)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[init] iterate postgres serial columns failed: %v", err)
+		return
+	}
+
+	for _, col := range columns {
+		// 获取序列名称
+		var seqName string
+		if err := db.QueryRow(`SELECT pg_get_serial_sequence($1, $2)`, col.TableName, col.ColumnName).Scan(&seqName); err != nil {
+			log.Printf("[init] get serial sequence failed: table=%s, column=%s, error=%v", col.TableName, col.ColumnName, err)
+			continue
+		}
+		if seqName == "" {
+			continue
+		}
+
+		// 仅当序列当前值小于 minSeq 时才设置
+		setSQL := fmt.Sprintf(`SELECT setval('%s', GREATEST((SELECT COALESCE(last_value, 0) FROM %s), %d))`, seqName, seqName, minSeq)
+		if _, err := db.Exec(setSQL); err != nil {
+			log.Printf("[init] set sequence failed: seq=%s, table=%s, error=%v", seqName, col.TableName, err)
 			continue
 		}
 	}
@@ -434,34 +539,14 @@ func initDefaultGroup() {
 }
 
 func ensureSettleTransferNoColumn(db *sql.DB) {
-	rows, err := db.Query(`PRAGMA table_info(settle)`)
-	if err != nil {
-		log.Printf("[init] query settle table info failed: %v", err)
-		return
-	}
-	defer rows.Close()
+	var hasTransferNo bool
 
-	hasTransferNo := false
-	for rows.Next() {
-		var cid int
-		var name string
-		var ctype string
-		var notnull int
-		var dflt sql.NullString
-		var pk int
-		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			log.Printf("[init] scan settle table info failed: %v", err)
-			continue
-		}
-		if name == "transfer_no" {
-			hasTransferNo = true
-			break
-		}
+	if AppConfig.IsSQLite() {
+		hasTransferNo = checkColumnSQLite(db, "settle", "transfer_no")
+	} else {
+		hasTransferNo = checkColumnPostgres(db, "settle", "transfer_no")
 	}
-	if err := rows.Err(); err != nil {
-		log.Printf("[init] iterate settle table info failed: %v", err)
-		return
-	}
+
 	if hasTransferNo {
 		return
 	}
@@ -473,6 +558,48 @@ func ensureSettleTransferNoColumn(db *sql.DB) {
 	log.Printf("[init] migration applied: add settle.transfer_no")
 }
 
+func checkColumnSQLite(db *sql.DB, tableName, columnName string) bool {
+	rows, err := db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, tableName))
+	if err != nil {
+		log.Printf("[init] query %s table info failed: %v", tableName, err)
+		return false
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name string
+		var ctype string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			log.Printf("[init] scan %s table info failed: %v", tableName, err)
+			continue
+		}
+		if name == columnName {
+			return true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[init] iterate %s table info failed: %v", tableName, err)
+	}
+	return false
+}
+
+func checkColumnPostgres(db *sql.DB, tableName, columnName string) bool {
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = $2 AND table_schema = 'public'`,
+		tableName, columnName,
+	).Scan(&count)
+	if err != nil {
+		log.Printf("[init] query %s.%s column existence failed: %v", tableName, columnName, err)
+		return false
+	}
+	return count > 0
+}
+
 // generateRandomString 生成指定长度的随机十六进制字符串（使用 crypto/rand）
 func generateRandomString(length int) string {
 	bytes := make([]byte, (length+1)/2)
@@ -480,6 +607,29 @@ func generateRandomString(length int) string {
 		log.Fatalf("[init] generate random bytes failed: %v", err)
 	}
 	return hex.EncodeToString(bytes)[:length]
+}
+
+// maskDSN 隐藏 DSN 中的密码字段，用于日志输出
+func maskDSN(dsn string) string {
+	// 匹配 password=xxx 模式
+	result := ""
+	for _, part := range strings.Split(dsn, " ") {
+		if strings.HasPrefix(part, "password=") {
+			result += "password=****"
+		} else {
+			result += part
+		}
+		result += " "
+	}
+	// 也处理 URL 格式 postgres://user:pass@host/db
+	if strings.Contains(result, "://") {
+		atIdx := strings.Index(result, "@")
+		colonIdx := strings.LastIndex(result[:atIdx], ":")
+		if colonIdx > 0 {
+			result = result[:colonIdx+1] + "****" + result[atIdx:]
+		}
+	}
+	return strings.TrimSpace(result)
 }
 
 // initSecurityCredentials 首次启动时随机生成管理员密码和系统密钥

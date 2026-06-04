@@ -8,6 +8,7 @@ import (
 	"gopay/src/plugin"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -490,29 +491,51 @@ func CleanupTask() {
 func DBBackupTask() {
 	log.Println("[cron] db backup task started")
 
-	srcPath := strings.TrimSpace(config.AppConfig.DBPath)
-	if srcPath == "" {
+	dsn := strings.TrimSpace(config.AppConfig.DBPath)
+	if dsn == "" {
 		log.Println("[cron] db backup skipped: empty db path")
 		return
 	}
 
-	absSrc, err := filepath.Abs(srcPath)
-	if err != nil {
-		log.Printf("[cron] db backup failed: resolve path error=%s", err.Error())
-		return
+	// SQLite: 备份目录在数据库文件同目录下
+	// PostgreSQL: 备份目录在当前工作目录下
+	var backupDir string
+	if config.AppConfig.IsSQLite() {
+		absSrc, err := filepath.Abs(dsn)
+		if err != nil {
+			log.Printf("[cron] db backup failed: resolve path error=%s", err.Error())
+			return
+		}
+		backupDir = filepath.Join(filepath.Dir(absSrc), "backup")
+	} else {
+		wd, err := os.Getwd()
+		if err != nil {
+			log.Printf("[cron] db backup failed: get working dir error=%s", err.Error())
+			return
+		}
+		backupDir = filepath.Join(wd, "backup")
 	}
 
-	backupDir := filepath.Join(filepath.Dir(absSrc), "backup")
 	if err := os.MkdirAll(backupDir, 0755); err != nil {
 		log.Printf("[cron] db backup failed: create backup dir error=%s", err.Error())
 		return
 	}
 
 	timestamp := time.Now().Format("20060102_150405")
-	targetPath := filepath.Join(backupDir, fmt.Sprintf("pay_%s.db", timestamp))
 
-	if err := sqliteVacuumIntoBackup(targetPath); err != nil {
-		log.Printf("[cron] db backup failed: error=%s", err.Error())
+	var targetPath string
+	var backupErr error
+
+	if config.AppConfig.IsSQLite() {
+		targetPath = filepath.Join(backupDir, fmt.Sprintf("pay_%s.db", timestamp))
+		backupErr = sqliteVacuumIntoBackup(targetPath)
+	} else {
+		targetPath = filepath.Join(backupDir, fmt.Sprintf("pay_%s.sql", timestamp))
+		backupErr = postgresBackup(dsn, targetPath)
+	}
+
+	if backupErr != nil {
+		log.Printf("[cron] db backup failed: error=%s", backupErr.Error())
 		return
 	}
 
@@ -529,7 +552,22 @@ func sqliteVacuumIntoBackup(targetPath string) error {
 	return nil
 }
 
+func postgresBackup(dsn string, targetPath string) error {
+	cmd := exec.Command("pg_dump", "--dbname", dsn, "--file", targetPath, "--format", "plain")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("pg_dump failed: %w, output: %s", err, string(output))
+	}
+	return nil
+}
+
 func cleanupOldBackups(backupDir string, keepDays int) {
+	// 根据数据库类型确定要清理的文件扩展名
+	ext := ".db"
+	if config.AppConfig.IsPostgres() {
+		ext = ".sql"
+	}
+
 	entries, err := os.ReadDir(backupDir)
 	if err != nil {
 		log.Printf("[cron] db backup cleanup skipped: read dir failed, error=%s", err.Error())
@@ -537,7 +575,7 @@ func cleanupOldBackups(backupDir string, keepDays int) {
 	}
 	expiredBefore := time.Now().AddDate(0, 0, -keepDays)
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".db") {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ext) {
 			continue
 		}
 		info, err := entry.Info()

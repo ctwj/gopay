@@ -13,6 +13,7 @@ import (
 func main() {
 	configPath := flag.String("config", "", "配置文件路径（默认自动查找 gopay.env / config.env / /etc/gopay/config.env）")
 	dbPath := flag.String("db", "", "数据库连接字符串（PostgreSQL）或文件路径（SQLite）")
+	dbType := flag.String("db-type", "", "数据库类型: sqlite 或 postgres（默认自动检测）")
 	host := flag.String("host", "", "监听IP地址（默认 0.0.0.0）")
 	port := flag.String("port", "", "服务端口（默认 8080）")
 	migrate := flag.Bool("migrate", false, "执行数据库迁移")
@@ -27,11 +28,13 @@ func main() {
 
 	// 合并配置：命令行参数 > 配置文件 > 默认值
 	db := config.GetConfigValue(*dbPath, "DB", "")
+	dt := config.GetConfigValue(*dbType, "DB_TYPE", "")
 	h := config.GetConfigValue(*host, "HOST", "0.0.0.0")
 	p := config.GetConfigValue(*port, "PORT", "8080")
 
 	r, addr, openURL, dbFile := initRuntime(runtimeOptions{
 		DBPath:  db,
+		DBType:  dt,
 		Host:    h,
 		Port:    p,
 		Migrate: *migrate,
@@ -45,6 +48,6 @@ func main() {
 			if err := r.Run(addr); err != nil {
 				log.Fatalf("[server] failed to start: %v", err)
 			}
-		})
+		}()
 	})
 }
